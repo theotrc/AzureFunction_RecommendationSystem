@@ -1,12 +1,21 @@
 import azure.functions as func
 import json
 import logging
+import traceback
+import time
 from recommender import get_recommendations, load_data
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 # Chargement des données au démarrage (une seule fois, pas à chaque requête)
-load_data()
+try:
+    start_time = time.time()
+    load_data()
+    elapsed = time.time() - start_time
+    logging.info(f"✓✓✓ Données de recommandation chargées en {elapsed:.2f}s")
+except Exception as e:
+    logging.error(f"✗✗✗ ERREUR CRITIQUE au démarrage: {str(e)}")
+    traceback.print_exc()
 
 
 @app.route(route="recommendations")
@@ -14,72 +23,99 @@ def recommend(req: func.HttpRequest) -> func.HttpResponse:
     """
     Azure Function HTTP trigger pour les recommandations d'articles.
 
-    Méthodes acceptées : GET, POST
+    GET  /api/recommendations?user_id=12345&n=5
+    POST /api/recommendations  body: {"user_id": 12345, "n": 5}
 
-    GET  /api/recommend?user_id=12345&n=5
-    POST /api/recommend  body: {"user_id": 12345, "n": 5}
-
-    Réponse 200 :
-        {
-            "user_id": 12345,
-            "recommendations": [101, 202, 303, 404, 505],
-            "cold_start": false
-        }
+    Optimisations implémentées:
+    - FAISS indexing pour recherche O(log N) au lieu de O(N)
+    - float32 embeddings (-50% RAM vs float64)
+    - Aucun full matrix multiplication en mémoire
     """
-    logging.info("Requête de recommandation reçue.")
-
+    start_time = time.time()
+    
     # ── Lecture des paramètres (GET ou POST) ──
     user_id = req.params.get("user_id")
     n = req.params.get("n", "5")
 
+    # ── Essayer de parser le JSON ──
     if not user_id:
         try:
             body = req.get_json()
             user_id = body.get("user_id")
-            n = body.get("n", 5)
-        except ValueError:
+            n = body.get("n", n)
+        except ValueError as e:
+            logging.warning(f"JSON invalide: {str(e)}")
             return func.HttpResponse(
-                json.dumps({"error": "Paramètre 'user_id' manquant."}),
+                json.dumps({"error": "Body JSON invalide ou 'user_id' manquant."}),
                 status_code=400,
                 mimetype="application/json",
             )
 
     if not user_id:
         return func.HttpResponse(
-            json.dumps({"error": "Paramètre 'user_id' manquant."}),
+            json.dumps({"error": "Paramètre 'user_id' est obligatoire."}),
             status_code=400,
             mimetype="application/json",
         )
 
+    # ── Validation des types ──
     try:
         user_id = int(user_id)
         n = int(n)
-    except (ValueError, TypeError):
+        
+        if user_id < 0:
+            raise ValueError("user_id ne peut pas être négatif")
+        if n <= 0 or n > 100:
+            raise ValueError("n doit être entre 1 et 100")
+            
+    except (ValueError, TypeError) as e:
+        logging.warning(f"Paramètres invalides: {str(e)}")
         return func.HttpResponse(
-            json.dumps({"error": "'user_id' et 'n' doivent être des entiers."}),
+            json.dumps({"error": f"Paramètres invalides: {str(e)}"}),
             status_code=400,
             mimetype="application/json",
         )
 
-    # ── Génération des recommandations ──
+    # ── Générer les recommandations ──
     try:
         recommendations, is_cold_start = get_recommendations(user_id, n=n)
-    except Exception as e:
-        logging.exception("Erreur lors du calcul des recommandations.")
+        
+        elapsed_ms = (time.time() - start_time) * 1000
+        
+        response = {
+            "user_id": user_id,
+            "recommendations": recommendations,
+            "cold_start": is_cold_start,
+            "count": len(recommendations),
+            "response_time_ms": round(elapsed_ms, 2),
+        }
+
+        logging.info(
+            f"✓ Recommandations: user_id={user_id}, count={len(recommendations)}, "
+            f"cold_start={is_cold_start}, time={elapsed_ms:.0f}ms"
+        )
+
         return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500,
+            json.dumps(response),
+            status_code=200,
             mimetype="application/json",
         )
 
-    response = {
-        "user_id": user_id,
-        "recommendations": recommendations,
-        "cold_start": is_cold_start,
-    }
-
-    return func.HttpResponse(
-        json.dumps(response),
-        status_code=200,
-        mimetype="application/json",
-    )
+    except RuntimeError as e:
+        logging.error(f"✗ Erreur runtime: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Service non disponible. Les données ne sont pas chargées."}),
+            status_code=503,
+            mimetype="application/json",
+        )
+    
+    except Exception as e:
+        logging.exception(f"✗ Erreur pour user_id={user_id}")
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Erreur interne du serveur",
+                "details": str(e)
+            }),
+            status_code=500,
+            mimetype="application/json",
+        )
