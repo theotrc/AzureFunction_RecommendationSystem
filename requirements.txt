@@ -1,0 +1,6 @@
+azure-functions
+numpy
+pandas
+scikit-learn
+azure-storage-blob
+python-dotenv
