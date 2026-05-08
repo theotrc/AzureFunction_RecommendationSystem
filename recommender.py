@@ -331,4 +331,130 @@ def _fallback_cosine_search(user_vector: np.ndarray, seen_articles: Set[int],
     return top_n["article_id"].tolist(), False
 
 
+def get_item_based_recommendations(user_id: int, n: int = 5) -> Tuple[List[int], bool]:
+    """
+    Recommande des articles similaires à ceux consultés par l'utilisateur.
+    
+    ITEM-BASED COLLABORATIVE FILTERING:
+    - Trouve les articles similaires à ceux que l'utilisateur a consultés
+    - Utilise la similarité des embeddings d'articles via FAISS
+    - Combinaison de scores pour chaque article similaire potentiel
+
+    Args:
+        user_id: ID de l'utilisateur
+        n: Nombre de recommandations (1-100)
+
+    Returns:
+        (article_ids, is_cold_start)
+    """
+    if n <= 0 or n > 100:
+        raise ValueError("n doit être entre 1 et 100")
+    data = _get_data()
+    user_seen = data["user_seen"]
+    articles = data["articles"]
+    embeddings = data["embeddings"]
+    cold_start = data["cold_start"]
+
+    # ── Cold start (utilisateur inconnu) ──
+    if user_id not in user_seen or len(user_seen.get(user_id, [])) == 0:
+        logging.warning(f"[COLD START] Utilisateur {user_id} n'a pas d'historique → recommandations populaires")
+        result = [int(x) for x in cold_start[:n].tolist()] if isinstance(cold_start, np.ndarray) else [int(x) for x in cold_start[:n]]
+        return result, True
+    # ── Articles vus par l'utilisateur ──
+    seen_articles_list = list(user_seen.get(user_id, []))
+    seen_articles_set = set(seen_articles_list)
+    # Mapper article_id → index dans la matrice
+    article_id_to_index = {article_id: idx for idx, article_id in enumerate(articles["article_id"].values)}
+    
+    # Vérifier que les articles vus existent
+    seen_indices = [article_id_to_index[aid] for aid in seen_articles_list if aid in article_id_to_index]
+    
+    if not seen_indices:
+        logging.warning(f"Aucun article vu trouvé pour user_id={user_id}")
+        result = [int(x) for x in cold_start[:n].tolist()] if isinstance(cold_start, np.ndarray) else [int(x) for x in cold_start[:n]]
+        return result, True
+    # ── Utiliser FAISS pour trouver les articles similaires ──
+    if _faiss_index is not None and HAS_FAISS:
+        
+        try:
+            article_scores = {}
+            n_similar = min(n * 10, 500)  # Chercher les 10*n articles similaires
+            
+            # Pour chaque article vu, chercher les articles similaires
+            for seen_idx in seen_indices:
+                # Obtenir l'embedding de l'article vu
+                article_embedding = embeddings[seen_idx:seen_idx+1].astype(np.float32)
+                
+                # Chercher les articles similaires
+                distances, indices = _faiss_index.search(article_embedding, n_similar)
+                scores = 1.0 / (1.0 + distances[0])  # Convertir distances en scores
+                
+                # Scorer les articles similaires
+                for idx, score in zip(indices, scores):
+                    article_id = articles["article_id"].values[idx]
+                    
+                    # Ne pas recommander les articles déjà vus
+                    if article_id not in seen_articles_set and score > 0:
+                        if article_id not in article_scores:
+                            article_scores[article_id] = 0
+                        article_scores[article_id] += score
+            if not article_scores:
+                logging.warning(f"Aucun article similaire trouvé pour user_id={user_id}")
+                result = [int(x) for x in cold_start[:n].tolist()] if isinstance(cold_start, np.ndarray) else [int(x) for x in cold_start[:n]]
+                return result, True
+            
+            # Trier par score décroissant et prendre le top N
+            sorted_articles = sorted(article_scores.items(), key=lambda x: x[1], reverse=True)
+            recommendations = [int(article_id) for article_id, _ in sorted_articles[:n]]
+            
+            logging.info(f"[ITEM-BASED] User {user_id}: {len(seen_articles_list)} articles vus → {len(recommendations)} recommandations")
+            return recommendations, False
+        
+        except Exception as e:
+            logging.warning(f"[ITEM-BASED] Erreur FAISS, fallback: {str(e)}")
+            return _item_based_fallback_cosine(seen_indices, seen_articles_set, articles, embeddings, cold_start, n)
+    
+    else:
+        # Fallback: cosine_similarity
+        return _item_based_fallback_cosine(seen_indices, seen_articles_set, articles, embeddings, cold_start, n)
+
+
+def _item_based_fallback_cosine(seen_indices: List[int], seen_articles_set: Set[int], 
+                                 articles: pd.DataFrame, embeddings: np.ndarray,
+                                 cold_start: np.ndarray, n: int) -> Tuple[List[int], bool]:
+    """
+    Fallback item-based sur cosine_similarity.
+    """
+    logging.warning("⚠️  Utilisation de cosine_similarity pour item-based (lent!)")
+    
+    article_scores = {}
+    
+    # Pour chaque article vu, chercher les articles similaires
+
+    for seen_idx in seen_indices:
+        seen_embedding = embeddings[seen_idx]
+        
+        # Calculer la similarité avec tous les autres articles
+        scores = cosine_similarity([seen_embedding], embeddings)[0]
+        
+        # Scorer les articles similaires (excluant ceux déjà vus)
+        for idx, score in enumerate(scores):
+            article_id = articles["article_id"].values[idx]
+            if article_id not in seen_articles_set and score > 0:
+                if article_id not in article_scores:
+                    article_scores[article_id] = 0
+                article_scores[article_id] += score
+
+    if not article_scores:
+        result = [int(x) for x in cold_start[:n].tolist()] if isinstance(cold_start, np.ndarray) else [int(x) for x in cold_start[:n]]
+        return result, True
+
+    # Trier et retourner top N
+    sorted_articles = sorted(article_scores.items(), key=lambda x: x[1], reverse=True)
+    recommendations = [int(article_id) for article_id, _ in sorted_articles[:n]]
+
+    print(f"Recommandations item-based (fallback): {recommendations}")
+    return recommendations, False
+
+
 
